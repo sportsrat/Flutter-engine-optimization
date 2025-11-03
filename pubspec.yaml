@@ -1,0 +1,24 @@
+name: flutter_pulse_profiler_2
+description: A profiler for Input->Paint latency
+publish_to: 'none'
+version: 0.0.1
+
+environment:
+  sdk: ">=2.18.0 <4.0.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  path_provider: ^2.0.15
+  flutter_cube: ^0.1.1
+  flutter_gl: ^0.0.21   # or latest available
+
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+
+flutter:
+
+    
+
