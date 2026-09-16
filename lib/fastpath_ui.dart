@@ -1,14 +1,10 @@
-// fast_path_core_with_custom_workers.dart
-// FastPath core — now supports user-defined custom worker isolates.
-
 import 'dart:async';
 import 'dart:collection';
-import 'dart:isolate';
+import 'dart:isolate' as isolate;
 import 'dart:math' as math;
+import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/widgets.dart';
 import 'package:flutter/material.dart';
-
-/// ---------------- PUBLIC API ----------------
 
 class FastPathConfig {
   final int coalesceWindowMs;
@@ -16,8 +12,6 @@ class FastPathConfig {
   final int uiBlockingSimMs;
   final double velocityThreshold;
   final double distanceThreshold;
-
-  /// Optional name of a registered custom worker
   final String? workerName;
 
   const FastPathConfig({
@@ -45,13 +39,11 @@ class FastPathController {
   void setUseFastPath(bool v) => useFastPath = v;
 }
 
-/// Interface for custom classifiers
 abstract class FastPathClassifier {
   bool isHeavy(PointerEvent e);
   void reset();
 }
 
-/// Default classifier based on configurable thresholds
 class DefaultFastClassifier implements FastPathClassifier {
   Offset? lastPos;
   int lastTime = 0;
@@ -82,31 +74,64 @@ class DefaultFastClassifier implements FastPathClassifier {
 
 class GestureMove {
   final Offset delta;
+  final Offset position;
   final int seq;
   final int gestureId;
-  GestureMove({required this.delta, required this.seq, required this.gestureId});
+  final bool isHeavy;
+  final bool isStart;
+
+  GestureMove({
+    required this.delta,
+    required this.position,
+    required this.seq,
+    required this.gestureId,
+    required this.isHeavy,
+    this.isStart = false,
+  });
 }
 
-/// ---------------- CUSTOM WORKER REGISTRY ----------------
-///
-/// Apps can register their own isolate entrypoints
-/// before the FastPathWidget is used.
-
-typedef WorkerEntry = void Function(SendPort sendPort);
+typedef WorkerEntry = void Function(dynamic sendPort);
 
 class FastPathWorkerRegistry {
   static final Map<String, WorkerEntry> _entries = {};
 
-  /// Register a new worker (must be top-level function)
   static void register(String name, WorkerEntry entry) {
     _entries[name] = entry;
   }
 
-  /// Internal: get worker by name
   static WorkerEntry? get(String name) => _entries[name];
 }
 
-/// ---------------- MAIN WIDGET ----------------
+abstract class _PortChannel {
+  void send(dynamic message);
+  void close();
+}
+
+class _WebPortChannel implements _PortChannel {
+  final StreamController _controller = StreamController.broadcast();
+  final void Function(dynamic) _onMessage;
+
+  _WebPortChannel(this._onMessage) {
+    _controller.stream.listen(_onMessage);
+  }
+
+  @override
+  void send(dynamic message) => _controller.add(message);
+
+  @override
+  void close() => _controller.close();
+}
+
+class _NativePortChannel implements _PortChannel {
+  final isolate.SendPort _port;
+  _NativePortChannel(this._port);
+
+  @override
+  void send(dynamic message) => _port.send(message);
+
+  @override
+  void close() {}
+}
 
 class FastPathWidget extends StatefulWidget {
   final Widget child;
@@ -146,9 +171,9 @@ class _FastPathWidgetState extends State<FastPathWidget> {
   int _lastCoalesceTime = 0;
   bool _disposed = false;
 
-  Isolate? _worker;
-  SendPort? _workerPort;
-  final ReceivePort _uiReceive = ReceivePort();
+  isolate.Isolate? _nativeWorker;
+  _PortChannel? _workerChannel;
+  isolate.ReceivePort? _nativeReceivePort;
 
   late final FastPathClassifier _classifier;
   late final FastPathController _controller;
@@ -165,24 +190,45 @@ class _FastPathWidgetState extends State<FastPathWidget> {
   }
 
   Future<void> _spawnWorker() async {
-    final ready = Completer<SendPort>();
+    final ready = Completer<_PortChannel>();
 
     final workerEntry =
         (_cfg.workerName != null ? FastPathWorkerRegistry.get(_cfg.workerName!) : null) ??
             _defaultWorkerEntry;
 
-    _worker = await Isolate.spawn(workerEntry, _uiReceive.sendPort);
-    _uiReceive.listen((msg) {
-      if (_disposed) return;
-      if (msg is SendPort) {
-        _workerPort = msg;
-        ready.complete(msg);
-      } else {
+    if (kIsWeb) {
+      final fromWorker = StreamController.broadcast();
+      fromWorker.stream.listen((msg) {
+        if (_disposed) return;
         _onWorkerMessage(msg);
-      }
-    });
+      });
 
-    _workerPort = await ready.future;
+      final mockSendPort = _WebMockSendPort(fromWorker);
+      workerEntry(mockSendPort);
+
+      _workerChannel = _WebPortChannel((msg) => mockSendPort.dispatchToWorker(msg));
+      ready.complete(_workerChannel);
+    } else {
+      _nativeReceivePort = isolate.ReceivePort();
+      _nativeReceivePort!.listen((msg) {
+        if (_disposed) return;
+        if (msg is isolate.SendPort) {
+          final channel = _NativePortChannel(msg);
+          _workerChannel = channel;
+          if (!ready.isCompleted) ready.complete(channel);
+        } else {
+          _onWorkerMessage(msg);
+        }
+      });
+
+      _nativeWorker = await isolate.Isolate.spawn(workerEntry, _nativeReceivePort!.sendPort);
+    }
+
+    _workerChannel = await ready.future;
+
+    while (_outgoingQueue.isNotEmpty) {
+      _workerChannel?.send(_outgoingQueue.removeFirst());
+    }
   }
 
   void _onWorkerMessage(dynamic msg) {
@@ -204,12 +250,12 @@ class _FastPathWidgetState extends State<FastPathWidget> {
   }
 
   void _sendToWorker(Map<String, dynamic> msg) {
-    if (_workerPort == null) {
+    if (_workerChannel == null) {
       if (_outgoingQueue.length >= _cfg.maxQueueSize) _outgoingQueue.removeFirst();
       _outgoingQueue.add(msg);
       return;
     }
-    _workerPort?.send(msg);
+    _workerChannel?.send(msg);
   }
 
   void _handlePointerDown(PointerDownEvent e) {
@@ -217,6 +263,16 @@ class _FastPathWidgetState extends State<FastPathWidget> {
     _currentGestureId = _gestureIdCounter;
     _gestureStates[_currentGestureId] = 'active';
     _classifier.reset();
+
+    widget.onClassifiedMove?.call(GestureMove(
+      delta: Offset.zero,
+      position: e.localPosition,
+      seq: ++_seqCounter,
+      gestureId: _currentGestureId,
+      isHeavy: false,
+      isStart: true,
+    ));
+
     widget.onRawPointer?.call(e);
   }
 
@@ -230,7 +286,14 @@ class _FastPathWidgetState extends State<FastPathWidget> {
     final seq = ++_seqCounter;
 
     if (!_controller.useFastPath) {
-      
+      _simulateHeavyBlocking(_cfg.uiBlockingSimMs);
+      widget.onClassifiedMove?.call(GestureMove(
+        delta: e.localDelta,
+        position: e.localPosition,
+        seq: seq,
+        gestureId: _currentGestureId,
+        isHeavy: isHeavy,
+      ));
     } else if (isHeavy) {
       final msg = {
         'gestureId': _currentGestureId,
@@ -242,14 +305,18 @@ class _FastPathWidgetState extends State<FastPathWidget> {
       _sendToWorker(msg);
       widget.onClassifiedMove?.call(GestureMove(
         delta: e.localDelta,
+        position: e.localPosition,
         seq: seq,
         gestureId: _currentGestureId,
+        isHeavy: true,
       ));
     } else {
       widget.onClassifiedMove?.call(GestureMove(
         delta: e.localDelta,
+        position: e.localPosition,
         seq: seq,
         gestureId: _currentGestureId,
+        isHeavy: false,
       ));
     }
 
@@ -275,16 +342,16 @@ class _FastPathWidgetState extends State<FastPathWidget> {
     widget.onRawPointer?.call(e);
   }
 
-  // void _simulateHeavyBlocking(int ms) {
-  //   final sw = Stopwatch()..start();
-  //   double acc = 0;
-  //   while (sw.elapsedMilliseconds < ms) {
-  //     for (int i = 0; i < 4000; i++) {
-  //       acc += math.sqrt(i * 1.2345);
-  //     }
-  //   }
-  //   if (acc.isNaN) debugPrint('');
-  // }
+  void _simulateHeavyBlocking(int ms) {
+    final sw = Stopwatch()..start();
+    double acc = 0;
+    while (sw.elapsedMilliseconds < ms) {
+      for (int i = 0; i < 4000; i++) {
+        acc += math.sqrt(i * 1.2345);
+      }
+    }
+    if (acc.isNaN) debugPrint('');
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -298,8 +365,9 @@ class _FastPathWidgetState extends State<FastPathWidget> {
 
   Future<void> _disposeInternals() async {
     _disposed = true;
-    _worker?.kill(priority: Isolate.immediate);
-    _uiReceive.close();
+    _workerChannel?.close();
+    _nativeWorker?.kill(priority: isolate.Isolate.immediate);
+    _nativeReceivePort?.close();
   }
 
   @override
@@ -309,25 +377,42 @@ class _FastPathWidgetState extends State<FastPathWidget> {
   }
 }
 
-/// ---------------- DEFAULT WORKER ----------------
+class _WebMockSendPort {
+  final StreamController _replyController;
+  final StreamController _incomingController = StreamController.broadcast();
 
-// ---------------- CLEAN WORKER (no fake heaviness) ----------------
-void _defaultWorkerEntry(SendPort sendPort) {
-  final port = ReceivePort();
-  sendPort.send(port.sendPort);
+  _WebMockSendPort(this._replyController);
 
-  port.listen((msg) {
+  void send(dynamic message) => _replyController.add(message);
+
+  void dispatchToWorker(dynamic message) => _incomingController.add(message);
+
+  _WebMockReceivePort get receivePort => _WebMockReceivePort(_incomingController);
+}
+
+class _WebMockReceivePort {
+  final StreamController _controller;
+  _WebMockReceivePort(this._controller);
+
+  void listen(void Function(dynamic) onData) {
+    _controller.stream.listen(onData);
+  }
+}
+
+void _defaultWorkerEntry(dynamic sendPort) {
+  final StreamController ctrl = StreamController.broadcast();
+  sendPort.send(ctrl.sink);
+
+  ctrl.stream.listen((msg) {
     if (msg is Map) {
       final int gestureId = msg['gestureId'] ?? 0;
       final int seq = msg['seq'] ?? 0;
       final bool isFinal = msg['isFinal'] ?? false;
 
-
-
       sendPort.send({
         'gestureId': gestureId,
         'seq': seq,
-        'latency': 0, // near-instant — isolates just pass data through
+        'latency': 0,
         'isFinal': isFinal,
       });
     }
