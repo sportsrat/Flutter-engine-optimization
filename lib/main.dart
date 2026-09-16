@@ -1,268 +1,11 @@
-// // main.dart
-// import 'dart:isolate';
-// import 'dart:math' as math;
-// import 'package:flutter/material.dart';
-
-// import 'fastpath_ui.dart'; // your core with FastPathWorkerRegistry
-
-// // -------------------------
-// // TOP-LEVEL HEAVY WORKER
-// // -------------------------
-// // Must be top-level. Runs inside a spawned isolate. Receives Map messages,
-// // does heavy CPU work, and replies with latency (ms) + any meta.
-// //
-// // WARNING: This deliberately does heavy work to demonstrate the pipeline.
-// // Reduce the LOOP_ITERS to make it less heavy on slower machines.
-// const int LOOP_ITERS = 3000000;
-
-// void heavyWorker(SendPort sendPort) {
-//   final port = ReceivePort();
-//   sendPort.send(port.sendPort);
-
-//   port.listen((msg) {
-//     if (msg is Map) {
-//       final int gestureId = msg['gestureId'] ?? 0;
-//       final int seq = msg['seq'] ?? 0;
-//       final bool isFinal = msg['isFinal'] ?? false;
-//       final dx = (msg['dx'] ?? 0.0) as double;
-//       final dy = (msg['dy'] ?? 0.0) as double;
-
-//       // Start timing inside worker
-//       final sw = Stopwatch()..start();
-
-//       // Real heavy compute simulation (replace with real ML / physics in practice)
-//       double acc = 0.0;
-//       // Use dx/dy slightly to vary work per message
-//       final base = dx + dy;
-//       for (int i = 0; i < LOOP_ITERS; i++) {
-//         // A mix of sin/cos to be expensive and non-trivial
-//         acc += math.sin(i * 0.0007 + base) * math.cos(i * 0.0003 + base);
-//       }
-
-//       sw.stop();
-
-//       // Send back result (keep map primitive-only)
-//       sendPort.send({
-//         'gestureId': gestureId,
-//         'seq': seq,
-//         'latency': sw.elapsedMilliseconds,
-//         'isFinal': isFinal,
-//         'meta': {
-//           'workUnits': acc.abs(),
-//           'iters': LOOP_ITERS,
-//         },
-//       });
-//     }
-//   });
-// }
-
-// // -------------------------
-// // Demo App: uses FastPathWidget
-// // -------------------------
-// void main() {
-//   // Register worker in the registry under a name before runApp
-//   FastPathWorkerRegistry.register('heavyWorker', heavyWorker);
-
-//   runApp(const MaterialApp(home: HeavyDemoPage()));
-// }
-
-// class HeavyDemoPage extends StatefulWidget {
-//   const HeavyDemoPage({super.key});
-//   @override
-//   State<HeavyDemoPage> createState() => _HeavyDemoPageState();
-// }
-
-// class _HeavyDemoPageState extends State<HeavyDemoPage> {
-//   final FastPathController _ctrl = FastPathController();
-
-//   // UI-side drawing points & latency (local measurement)
-//   final List<Offset> _points = [];
-//   final List<int> _uiLatencies = []; // newest-first
-//   final List<int> _workerLatencies = []; // newest-first (reports from worker)
-//   static const int _maxSamples = 100;
-
-//   bool _useFastPath = true;
-//   int _numPointsShown = 800;
-
-//   @override
-//   void initState() {
-//     super.initState();
-//     _ctrl.setUseFastPath(true);
-//   }
-
-//   @override
-//   void dispose() {
-//     _ctrl.dispose();
-//     super.dispose();
-//   }
-
-//   int _percentile(List<int> a, double p) {
-//     if (a.isEmpty) return 0;
-//     final sorted = List<int>.from(a)..sort();
-//     final idx = ((sorted.length - 1) * p).round().clamp(0, sorted.length - 1);
-//     return sorted[idx];
-//   }
-
-//   void _onClassifiedMove(GestureMove move) {
-//     // UI-side latency stopwatch
-//     final sw = Stopwatch()..start();
-
-//     setState(() {
-//       final last = _points.isNotEmpty ? _points.last : const Offset(200, 300);
-//       final next = last + move.delta;
-//       _points.add(next);
-//       if (_points.length > _numPointsShown) {
-//         _points.removeRange(0, _points.length - _numPointsShown);
-//       }
-//     });
-
-//     WidgetsBinding.instance.addPostFrameCallback((_) {
-//       sw.stop();
-//       final ms = sw.elapsedMilliseconds;
-//       setState(() {
-//         _uiLatencies.insert(0, ms);
-//         if (_uiLatencies.length > _maxSamples) _uiLatencies.removeLast();
-//       });
-//     });
-//   }
-
-//   void _onWorkerSamples(List<int> samples) {
-//     setState(() {
-//       // core may send latency samples (worker-side); keep a copy
-//       _workerLatencies.clear();
-//       _workerLatencies.addAll(samples);
-//       if (_workerLatencies.length > _maxSamples) {
-//         _workerLatencies.removeRange(_maxSamples, _workerLatencies.length);
-//       }
-//     });
-//   }
-
-//   @override
-//   Widget build(BuildContext context) {
-//     final uiP50 = _percentile(_uiLatencies, 0.5);
-//     final workerP50 = _percentile(_workerLatencies, 0.5);
-//     final latestWorker = _workerLatencies.isEmpty ? 0 : _workerLatencies.first;
-//     final latestUi = _uiLatencies.isEmpty ? 0 : _uiLatencies.first;
-
-//     return Scaffold(
-//       appBar: AppBar(
-//         title: const Text('Heavy Worker Demo (main.dart)'),
-//         backgroundColor: Colors.deepPurple,
-//         actions: [
-//           TextButton(
-//             onPressed: () => setState(() {
-//               _useFastPath = !_useFastPath;
-//               _ctrl.setUseFastPath(_useFastPath);
-//             }),
-//             child: Text(_useFastPath ? 'Use Baseline' : 'Use FastPath',
-//                 style: const TextStyle(color: Colors.white)),
-//           ),
-//           IconButton(
-//             icon: const Icon(Icons.clear),
-//             onPressed: () => setState(() {
-//               _points.clear();
-//               _uiLatencies.clear();
-//               _workerLatencies.clear();
-//             }),
-//           ),
-//         ],
-//       ),
-//       body: Stack(
-//         children: [
-//           // Drawing area
-//           Positioned.fill(
-//             child: FastPathWidget(
-//               controller: _ctrl,
-//               config: const FastPathConfig(
-//                 workerName: 'heavyWorker', // use the heavy worker we registered
-//                 coalesceWindowMs: 10,
-//                 maxQueueSize: 8,
-//                 uiBlockingSimMs: 0, // ensure core won't simulate UI blocking
-//               ),
-//               customClassifier: _DiagonalClassifier(), // decide when to offload
-//               onClassifiedMove: _onClassifiedMove,
-//               onLatencySamples: _onWorkerSamples, // get worker-side reported latencies
-//               child: CustomPaint(
-//                 painter: _Painter(List<Offset>.from(_points)),
-//                 child: Container(color: Colors.black),
-//               ),
-//             ),
-//           ),
-
-//           // Overlay telemetry
-//           Positioned(
-//             left: 12,
-//             top: 12,
-//             child: Container(
-//               padding: const EdgeInsets.all(10),
-//               decoration: BoxDecoration(color: Colors.black54, borderRadius: BorderRadius.circular(8)),
-//               child: DefaultTextStyle(
-//                 style: const TextStyle(fontFamily: 'monospace', color: Colors.white, fontSize: 12),
-//                 child: Column(
-//                   crossAxisAlignment: CrossAxisAlignment.start,
-//                   children: [
-//                     Text('UI p50: ${uiP50} ms  latest: ${latestUi} ms'),
-//                     const SizedBox(height: 6),
-//                     Text('Worker p50: ${workerP50} ms  latest: ${latestWorker} ms'),
-//                     const SizedBox(height: 6),
-//                     Text('Worker iters: $LOOP_ITERS'),
-//                     const SizedBox(height: 6),
-//                     Text('Points: ${_points.length}'),
-//                   ],
-//                 ),
-//               ),
-//             ),
-//           ),
-//         ],
-//       ),
-//     );
-//   }
-// }
-
-// // Simple diagonal classifier (offloads when both axes move enough)
-// class _DiagonalClassifier implements FastPathClassifier {
-//   @override
-//   bool isHeavy(PointerEvent e) {
-//     return e.localDelta.dx.abs() > 8 && e.localDelta.dy.abs() > 8;
-//   }
-
-//   @override
-//   void reset() {}
-// }
-
-// // Simple painter
-// class _Painter extends CustomPainter {
-//   final List<Offset> pts;
-//   _Painter(this.pts);
-
-//   @override
-//   void paint(Canvas c, Size s) {
-//     final p = Paint()
-//       ..color = Colors.lightGreenAccent
-//       ..strokeWidth = 3
-//       ..strokeCap = StrokeCap.round;
-//     for (int i = 1; i < pts.length; i++) {
-//       c.drawLine(pts[i - 1], pts[i], p);
-//     }
-//   }
-
-//   @override
-//   bool shouldRepaint(covariant _Painter old) => true;
-// }
-
 import 'dart:isolate';
 import 'dart:math' as math;
 import 'package:flutter/material.dart';
-import 'fastpath_ui.dart'; // your FastPath core file
+import 'fastpath_ui.dart';
 
-// -------------------------
-// TOP-LEVEL HEAVY WORKER
-// -------------------------
-// Runs off the UI thread (spawned by FastPath).
-// Performs deliberately expensive math for demo purposes.
 const int LOOP_ITERS = 3000000;
 
-void heavyWorker(SendPort sendPort) {
+void heavyWorker(dynamic sendPort) {
   final port = ReceivePort();
   sendPort.send(port.sendPort);
 
@@ -274,7 +17,6 @@ void heavyWorker(SendPort sendPort) {
       final dx = (msg['dx'] ?? 0.0) as double;
       final dy = (msg['dy'] ?? 0.0) as double;
 
-      // Real heavy compute simulation (like ML or physics)
       final sw = Stopwatch()..start();
       double acc = 0.0;
       final base = dx + dy;
@@ -283,7 +25,6 @@ void heavyWorker(SendPort sendPort) {
       }
       sw.stop();
 
-      // Send latency result back
       sendPort.send({
         'gestureId': gestureId,
         'seq': seq,
@@ -295,12 +36,20 @@ void heavyWorker(SendPort sendPort) {
   });
 }
 
-// -------------------------
-// MAIN APP ENTRY
-// -------------------------
 void main() {
   FastPathWorkerRegistry.register('heavyWorker', heavyWorker);
-  runApp(const MaterialApp(home: HeavyDemoPage()));
+  runApp(const MaterialApp(
+    debugShowCheckedModeBanner: false,
+    home: HeavyDemoPage(),
+  ));
+}
+
+class StrokeSegment {
+  final Offset start;
+  final Offset end;
+  final bool isHeavy;
+
+  StrokeSegment({required this.start, required this.end, required this.isHeavy});
 }
 
 class HeavyDemoPage extends StatefulWidget {
@@ -311,15 +60,21 @@ class HeavyDemoPage extends StatefulWidget {
 
 class _HeavyDemoPageState extends State<HeavyDemoPage> {
   final FastPathController _ctrl = FastPathController();
-  final List<Offset> _points = [];
+
+  final List<StrokeSegment> _segments = [];
+  Offset? _lastPosition;
   final List<int> _uiLatencies = [];
   final List<int> _workerLatencies = [];
   static const int _maxSamples = 100;
 
+  bool _useFastPath = true;
+  int _fastCount = 0;
+  int _heavyCount = 0;
+
   @override
   void initState() {
     super.initState();
-    _ctrl.setUseFastPath(true); // always fast path
+    _ctrl.setUseFastPath(true);
   }
 
   @override
@@ -339,11 +94,28 @@ class _HeavyDemoPageState extends State<HeavyDemoPage> {
     final sw = Stopwatch()..start();
 
     setState(() {
-      final last = _points.isNotEmpty ? _points.last : const Offset(200, 300);
-      final next = last + move.delta;
-      _points.add(next);
-      if (_points.length > 800) {
-        _points.removeRange(0, _points.length - 800);
+      if (move.isStart) {
+        _lastPosition = move.position;
+        return;
+      }
+
+      if (_lastPosition != null) {
+        _segments.add(StrokeSegment(
+          start: _lastPosition!,
+          end: move.position,
+          isHeavy: move.isHeavy,
+        ));
+        _lastPosition = move.position;
+
+        if (move.isHeavy) {
+          _heavyCount++;
+        } else {
+          _fastCount++;
+        }
+
+        if (_segments.length > 1200) {
+          _segments.removeRange(0, _segments.length - 1200);
+        }
       }
     });
 
@@ -368,68 +140,124 @@ class _HeavyDemoPageState extends State<HeavyDemoPage> {
     });
   }
 
+  Color _getLatencyColor(int ms) {
+    if (ms < 16) return const Color(0xFF00FF88);
+    if (ms < 33) return Colors.amberAccent;
+    return const Color(0xFFFF3366);
+  }
+
   @override
   Widget build(BuildContext context) {
     final uiP50 = _percentile(_uiLatencies, 0.5);
     final workerP50 = _percentile(_workerLatencies, 0.5);
 
     return Scaffold(
+      backgroundColor: const Color(0xFF0A0A12),
       appBar: AppBar(
-        title: const Text('FastPath Heavy Demo'),
-        backgroundColor: Colors.deepPurple,
+        title: const Text('Flutter Pulse Engine', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 18)),
+        backgroundColor: const Color(0xFF161626),
+        elevation: 4,
         actions: [
+          Container(
+            margin: const EdgeInsets.symmetric(vertical: 8, horizontal: 8),
+            child: ElevatedButton.icon(
+              style: ElevatedButton.styleFrom(
+                backgroundColor: _useFastPath ? const Color(0xFF00FF88) : const Color(0xFFFF5500),
+                foregroundColor: Colors.black,
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+              ),
+              onPressed: () => setState(() {
+                _useFastPath = !_useFastPath;
+                _ctrl.setUseFastPath(_useFastPath);
+              }),
+              icon: Icon(_useFastPath ? Icons.flash_on : Icons.block, size: 16),
+              label: Text(_useFastPath ? 'FastPath Active' : 'Baseline Mode', style: const TextStyle(fontWeight: FontWeight.bold)),
+            ),
+          ),
           IconButton(
-            icon: const Icon(Icons.clear),
+            icon: const Icon(Icons.refresh, color: Colors.white70),
             onPressed: () => setState(() {
-              _points.clear();
+              _segments.clear();
               _uiLatencies.clear();
               _workerLatencies.clear();
+              _fastCount = 0;
+              _heavyCount = 0;
+              _lastPosition = null;
             }),
           ),
         ],
       ),
       body: Stack(
         children: [
-          // Drawing area
           Positioned.fill(
             child: FastPathWidget(
               controller: _ctrl,
               config: const FastPathConfig(
-                workerName: 'heavyWorker', // our custom heavy isolate
-                coalesceWindowMs: 10,
+                workerName: 'heavyWorker',
+                coalesceWindowMs: 8,
                 maxQueueSize: 8,
-                uiBlockingSimMs: 0,
+                uiBlockingSimMs: 35,
               ),
               customClassifier: _DiagonalClassifier(),
               onClassifiedMove: _onClassifiedMove,
               onLatencySamples: _onWorkerSamples,
               child: CustomPaint(
-                painter: _Painter(List<Offset>.from(_points)),
-                child: Container(color: Colors.black),
+                painter: _CanvasPainter(List<StrokeSegment>.from(_segments)),
+                child: Container(color: Colors.transparent),
               ),
             ),
           ),
 
-          // Telemetry overlay
+          // Enhanced Telemetry Overlay
           Positioned(
-            left: 12,
-            top: 12,
+            left: 16,
+            top: 16,
             child: Container(
-              padding: const EdgeInsets.all(10),
-              decoration: BoxDecoration(color: Colors.black54, borderRadius: BorderRadius.circular(8)),
+              padding: const EdgeInsets.all(14),
+              decoration: BoxDecoration(
+                color: const Color(0xFF121220).withOpacity(0.9),
+                borderRadius: BorderRadius.circular(12),
+                border: Border.all(color: Colors.white.withOpacity(0.1)),
+                boxShadow: const [BoxShadow(color: Colors.black45, blurRadius: 10)],
+              ),
               child: DefaultTextStyle(
                 style: const TextStyle(fontFamily: 'monospace', color: Colors.white, fontSize: 12),
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    const Text('FAST PATH MODE (Heavy Worker Active)'),
+                    Row(
+                      children: [
+                        Container(width: 8, height: 8, decoration: BoxDecoration(color: _getLatencyColor(uiP50), shape: BoxShape.circle)),
+                        const SizedBox(width: 8),
+                        Text('UI p50 Latency: ', style: const TextStyle(color: Colors.white70)),
+                        Text('$uiP50 ms', style: TextStyle(color: _getLatencyColor(uiP50), fontWeight: FontWeight.bold)),
+                      ],
+                    ),
                     const SizedBox(height: 6),
-                    Text('UI p50: ${uiP50} ms'),
-                    Text('Worker p50: ${workerP50} ms'),
-                    const SizedBox(height: 6),
-                    Text('Iterations: $LOOP_ITERS'),
-                    const SizedBox(height: 6),
-                    Text('Samples: ${_workerLatencies.length}'),
+                    Row(
+                      children: [
+                        Container(width: 8, height: 8, decoration: const BoxDecoration(color: Color(0xFFFF5500), shape: BoxShape.circle)),
+                        const SizedBox(width: 8),
+                        const Text('Worker p50 Latency: ', style: TextStyle(color: Colors.white70)),
+                        Text('$workerP50 ms', style: const TextStyle(color: Color(0xFFFF5500), fontWeight: FontWeight.bold)),
+                      ],
+                    ),
+                    const Divider(color: Colors.white24, height: 16),
+                    Row(
+                      children: [
+                        Container(width: 10, height: 3, color: const Color(0xFF00FF88)),
+                        const SizedBox(width: 6),
+                        Text('Fast Path (UI): $_fastCount', style: const TextStyle(color: Color(0xFF00FF88))),
+                      ],
+                    ),
+                    const SizedBox(height: 4),
+                    Row(
+                      children: [
+                        Container(width: 10, height: 3, color: const Color(0xFFFF5500)),
+                        const SizedBox(width: 6),
+                        Text('Heavy Path (Worker): $_heavyCount', style: const TextStyle(color: Color(0xFFFF5500))),
+                      ],
+                    ),
                   ],
                 ),
               ),
@@ -441,7 +269,6 @@ class _HeavyDemoPageState extends State<HeavyDemoPage> {
   }
 }
 
-// Simple diagonal classifier — defines what counts as "heavy"
 class _DiagonalClassifier implements FastPathClassifier {
   @override
   bool isHeavy(PointerEvent e) {
@@ -452,22 +279,27 @@ class _DiagonalClassifier implements FastPathClassifier {
   void reset() {}
 }
 
-// Draws the stroke path
-class _Painter extends CustomPainter {
-  final List<Offset> pts;
-  _Painter(this.pts);
+class _CanvasPainter extends CustomPainter {
+  final List<StrokeSegment> segments;
+  _CanvasPainter(this.segments);
 
   @override
-  void paint(Canvas c, Size s) {
-    final p = Paint()
-      ..color = Colors.lightGreenAccent
-      ..strokeWidth = 3
+  void paint(Canvas canvas, Size size) {
+    final fastPaint = Paint()
+      ..color = const Color(0xFF00FF88)
+      ..strokeWidth = 3.5
       ..strokeCap = StrokeCap.round;
-    for (int i = 1; i < pts.length; i++) {
-      c.drawLine(pts[i - 1], pts[i], p);
+
+    final heavyPaint = Paint()
+      ..color = const Color(0xFFFF5500)
+      ..strokeWidth = 4.5
+      ..strokeCap = StrokeCap.round;
+
+    for (final seg in segments) {
+      canvas.drawLine(seg.start, seg.end, seg.isHeavy ? heavyPaint : fastPaint);
     }
   }
 
   @override
-  bool shouldRepaint(covariant _Painter old) => true;
+  bool shouldRepaint(covariant _CanvasPainter oldDelegate) => true;
 }
