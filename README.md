@@ -33,7 +33,7 @@ Flutter applications rely heavily on the UI isolate for BOTH rendering and user 
                    └─────────┬─────────┘
                              ▼
                        Gesture Result
-
+```
 
 ## Fast Path
 
@@ -55,15 +55,15 @@ The engine tracks:
 ## Running
 ```bash
 flutter pub get
-
+```
 ```bash
 in chrome
 flutter run -d chrome
-
+```
 ```bash
 in windows
 flutter run -d windows
-
+```
 ### Prerequisites
 
 - Flutter SDK
